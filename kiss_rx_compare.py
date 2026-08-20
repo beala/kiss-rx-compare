@@ -313,8 +313,33 @@ def configure_us_defaults(link: RadioLink, print_lock: threading.Lock):
 
 # --- Port discovery ---------------------------------------------------------
 
+BY_ID_DIR = Path("/dev/serial/by-id")
+
+
+def by_id_for_device(dev_path: str) -> str | None:
+    """Return the /dev/serial/by-id/* symlink pointing at dev_path, if any."""
+    if not BY_ID_DIR.is_dir():
+        return None
+    try:
+        target = Path(dev_path).resolve()
+    except OSError:
+        return None
+    for link in BY_ID_DIR.iterdir():
+        try:
+            if link.resolve() == target:
+                return str(link)
+        except OSError:
+            continue
+    return None
+
+
 def discover_ports():
-    return sorted(list_ports.comports(), key=lambda p: p.device)
+    ports = sorted(list_ports.comports(), key=lambda p: p.device)
+    for p in ports:
+        by_id = by_id_for_device(p.device)
+        if by_id:
+            p.device = by_id
+    return ports
 
 
 def prompt_choice(ports, label):
@@ -333,13 +358,26 @@ def prompt_choice(ports, label):
         print("Invalid selection, try again.")
 
 
-def select_ports(explicit_a, explicit_b):
+def select_ports(explicit_a, explicit_b, single=False):
+    """Returns (port_a, port_b). port_b is None when running in single-radio mode."""
     if explicit_a and explicit_b:
         return explicit_a, explicit_b
 
     ports = discover_ports()
+
+    if single:
+        if explicit_a:
+            return explicit_a, None
+        if len(ports) == 1:
+            return ports[0].device, None
+        if not ports:
+            print("No serial ports found. Plug in the radio and retry, or pass --port-a explicitly.")
+            sys.exit(1)
+        return prompt_choice(ports, "A"), None
+
     if explicit_a:
-        remaining = [p for p in ports if p.device != explicit_a]
+        explicit_a_real = Path(explicit_a).resolve()
+        remaining = [p for p in ports if Path(p.device).resolve() != explicit_a_real]
         if len(remaining) == 1:
             return explicit_a, remaining[0].device
         return explicit_a, prompt_choice(remaining or ports, "B")
@@ -349,7 +387,10 @@ def select_ports(explicit_a, explicit_b):
 
     if len(ports) < 2:
         print(f"Only found {len(ports)} serial port(s): {[p.device for p in ports]}")
-        print("Need two connected radios. Plug in both devices and retry, or pass --port-a/--port-b explicitly.")
+        print(
+            "Need two connected radios. Plug in both devices and retry, pass --port-a/--port-b "
+            "explicitly, or pass --single to test with just one radio."
+        )
         sys.exit(1)
 
     print(f"Found {len(ports)} serial ports, ambiguous which two are the radios.")
@@ -368,14 +409,20 @@ def main():
         "--log-dir", default=".", help="Directory to write per-radio JSONL logs into (default: cwd)"
     )
     parser.add_argument("--no-file-log", action="store_true", help="Only print to console, don't write log files")
+    parser.add_argument(
+        "--single", action="store_true", help="Run with only one radio connected (for testing)"
+    )
     args = parser.parse_args()
 
-    port_a, port_b = select_ports(args.port_a, args.port_b)
+    port_a, port_b = select_ports(args.port_a, args.port_b, single=args.single)
     print(f"Radio A: {port_a}")
-    print(f"Radio B: {port_b}")
+    if port_b:
+        print(f"Radio B: {port_b}")
+    else:
+        print("Radio B: (none — single-radio mode)")
 
     ser_a = serial.Serial(port_a, args.baud, timeout=READ_TIMEOUT_S)
-    ser_b = serial.Serial(port_b, args.baud, timeout=READ_TIMEOUT_S)
+    ser_b = serial.Serial(port_b, args.baud, timeout=READ_TIMEOUT_S) if port_b else None
 
     log_fh_a = log_fh_b = None
     if not args.no_file_log:
@@ -383,26 +430,28 @@ def main():
         log_dir = Path(args.log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
         log_fh_a = open(log_dir / f"kiss_rx_{ts}_A.jsonl", "w")
-        log_fh_b = open(log_dir / f"kiss_rx_{ts}_B.jsonl", "w")
+        if port_b:
+            log_fh_b = open(log_dir / f"kiss_rx_{ts}_B.jsonl", "w")
 
     link_a = RadioLink(label="A", port=port_a, ser=ser_a, log_fh=log_fh_a)
-    link_b = RadioLink(label="B", port=port_b, ser=ser_b, log_fh=log_fh_b)
+    link_b = RadioLink(label="B", port=port_b, ser=ser_b, log_fh=log_fh_b) if port_b else None
+    links = [link_a] + ([link_b] if link_b else [])
 
     print_lock = threading.Lock()
 
-    print("Configuring US-band defaults on both radios...")
-    configure_us_defaults(link_a, print_lock)
-    configure_us_defaults(link_b, print_lock)
+    print(f"Configuring US-band defaults on {'both radios' if link_b else 'the radio'}...")
+    for link in links:
+        configure_us_defaults(link, print_lock)
 
     stop_event = threading.Event()
     threads = [
-        threading.Thread(target=reader_thread, args=(link_a, print_lock, stop_event), daemon=True),
-        threading.Thread(target=reader_thread, args=(link_b, print_lock, stop_event), daemon=True),
+        threading.Thread(target=reader_thread, args=(link, print_lock, stop_event), daemon=True)
+        for link in links
     ]
     for t in threads:
         t.start()
 
-    print("\nListening for packets on both radios. Press Ctrl+C to stop.\n")
+    print(f"\nListening for packets on {'both radios' if link_b else 'the radio'}. Press Ctrl+C to stop.\n")
     try:
         while True:
             time.sleep(0.5)
@@ -412,13 +461,12 @@ def main():
         stop_event.set()
         for t in threads:
             t.join(timeout=1.0)
-        ser_a.close()
-        ser_b.close()
-        if log_fh_a:
-            log_fh_a.close()
-        if log_fh_b:
-            log_fh_b.close()
-        print(f"\nDone. Radio A received {link_a.packet_count} packet(s), Radio B received {link_b.packet_count} packet(s).")
+        for link in links:
+            link.ser.close()
+            if link.log_fh:
+                link.log_fh.close()
+        summary = ", ".join(f"Radio {link.label} received {link.packet_count} packet(s)" for link in links)
+        print(f"\nDone. {summary}.")
 
 
 if __name__ == "__main__":

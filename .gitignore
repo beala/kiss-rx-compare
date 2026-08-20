@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 *.jsonl
 .venv/
+.python-version.local
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+.DS_Store
