@@ -3,8 +3,9 @@
 Compares LoRa reception between two [MeshCore](https://github.com/meshcore-dev/MeshCore)
 radios running the `kiss_modem` firmware example.
 
-Connects to both serial devices, configures each for US-band defaults
-(915 MHz / 250 kHz BW / SF10 / CR5 / 20 dBm), and logs every received
+Connects to both serial devices, configures each for the MeshCore
+USA/Canada preset (910.525 MHz / 62.5 kHz BW / SF7 / CR5, TX power
+set to 0 dBm for close-range bench testing), and logs every received
 packet from both radios side by side (payload + RSSI/SNR) so their
 reception can be compared.
 

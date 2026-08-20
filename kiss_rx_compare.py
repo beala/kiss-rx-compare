@@ -2,8 +2,9 @@
 """
 Compare LoRa reception between two MeshCore KISS-modem radios.
 
-Connects to both serial devices, configures each for US-band defaults
-(915 MHz / 250 kHz BW / SF10 / CR5 / 20 dBm), and logs every received
+Connects to both serial devices, configures each for the MeshCore
+USA/Canada preset (910.525 MHz / 62.5 kHz BW / SF7 / CR5, TX power
+set to 0 dBm for close-range bench testing), and logs every received
 packet from both radios side by side (payload + RSSI/SNR/timing) so
 their reception can be compared.
 
@@ -12,6 +13,8 @@ Requires: pyserial (pip install pyserial)
 
 import argparse
 import json
+import os
+import signal
 import struct
 import sys
 import threading
@@ -52,12 +55,12 @@ def hw_resp(cmd):
     return cmd | 0x80
 
 
-# US-band defaults, matching examples/companion_radio/MyMesh.h LORA_* defaults.
-US_FREQ_HZ = 915_000_000
-US_BW_HZ = 250_000
-US_SF = 10
+# US/Canada preset (MeshCore "narrow" recommended default as of Oct 2025).
+US_FREQ_HZ = 910_525_000
+US_BW_HZ = 62_500
+US_SF = 7
 US_CR = 5
-US_TX_POWER_DBM = 20
+US_TX_POWER_DBM = 0
 
 READ_TIMEOUT_S = 0.2
 STARTUP_RESPONSE_TIMEOUT_S = 2.0
@@ -451,12 +454,22 @@ def main():
     for t in threads:
         t.start()
 
+    sigint_count = 0
+
+    def handle_sigint(signum, frame):
+        nonlocal sigint_count
+        sigint_count += 1
+        if sigint_count == 1:
+            stop_event.set()
+        else:
+            os._exit(1)
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
     print(f"\nListening for packets on {'both radios' if link_b else 'the radio'}. Press Ctrl+C to stop.\n")
     try:
-        while True:
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        pass
+        while not stop_event.is_set():
+            time.sleep(0.2)
     finally:
         stop_event.set()
         for t in threads:
