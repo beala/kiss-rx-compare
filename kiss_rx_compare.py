@@ -44,6 +44,7 @@ HW_CMD_SET_TX_POWER = 0x0A
 HW_CMD_GET_RADIO = 0x0B
 HW_CMD_GET_NOISE_FLOOR = 0x10
 HW_CMD_GET_VERSION = 0x11
+HW_CMD_GET_STATS = 0x12
 HW_CMD_GET_DEVICE_NAME = 0x16
 HW_CMD_PING = 0x17
 
@@ -51,6 +52,8 @@ HW_RESP_OK = 0xF0
 HW_RESP_ERROR = 0xF1
 HW_RESP_TX_DONE = 0xF8
 HW_RESP_RX_META = 0xF9
+
+STATS_POLL_INTERVAL_S = 5.0
 
 
 def hw_resp(cmd):
@@ -181,6 +184,8 @@ def format_console(event: dict) -> str:
         return f"{prefix}HW OK"
     if kind == "tx_done":
         return f"{prefix}TX done result=0x{event['result']:02X}"
+    if kind == "stats":
+        return f"{prefix}STATS rx={event['rx']} tx={event['tx']} errors={event['errors']}"
     if kind == "info":
         return f"{prefix}{event['message']}"
     return f"{prefix}{event}"
@@ -257,6 +262,11 @@ def handle_frame(link: RadioLink, frame: bytes, print_lock: threading.Lock):
         if sub_cmd == HW_RESP_TX_DONE:
             result = payload[0] if payload else 0
             log_event(link, {"type": "tx_done", "result": result}, print_lock)
+            return
+
+        if sub_cmd == hw_resp(HW_CMD_GET_STATS) and len(payload) >= 12:
+            rx, tx, errors = struct.unpack("<III", payload[:12])
+            log_event(link, {"type": "stats", "rx": rx, "tx": tx, "errors": errors}, print_lock)
             return
 
         log_event(link, {"type": "hw_resp", "sub_cmd": sub_cmd, "payload_hex": hexdump(payload)}, print_lock)
@@ -534,8 +544,13 @@ def main():
 
     print(f"\nListening for packets on {'both radios' if link_b else 'the radio'}. Press Ctrl+C to stop.\n")
     try:
+        next_stats_poll = time.time() + STATS_POLL_INTERVAL_S
         while not stop_event.is_set():
             time.sleep(0.2)
+            if time.time() >= next_stats_poll:
+                for link in links:
+                    link.ser.write(encode_hw_frame(HW_CMD_GET_STATS))
+                next_stats_poll = time.time() + STATS_POLL_INTERVAL_S
     finally:
         stop_event.set()
         for t in threads:
