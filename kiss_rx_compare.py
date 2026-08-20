@@ -334,6 +334,21 @@ def run_radio_diagnostics(link: RadioLink, print_lock: threading.Lock):
     log_event(link, {"type": "info", "message": message}, print_lock)
 
 
+def kick_into_rx_mode(link: RadioLink, print_lock: threading.Lock):
+    """Transmit a throwaway packet to force the firmware's RX state machine to
+    reset. A live SetRadio doesn't itself re-arm the receiver on the new
+    frequency -- that only happens on TX completion or the next periodic AGC
+    reset (up to 30s later), so without this the radio can silently sit
+    deaf-but-configured right after startup."""
+    link.ser.write(encode_kiss_frame(KISS_CMD_DATA, b"\x00"))
+    payload = wait_for_reply(link, HW_RESP_TX_DONE, timeout=5.0)
+    if payload is not None and len(payload) >= 1:
+        message = "Kick TX " + ("OK" if payload[0] else "FAILED (radio reported TX failure)")
+    else:
+        message = "Kick TX FAILED (no TX_DONE response)"
+    log_event(link, {"type": "info", "message": message}, print_lock)
+
+
 def configure_us_defaults(link: RadioLink, print_lock: threading.Lock):
     radio_payload = struct.pack("<IIBB", US_FREQ_HZ, US_BW_HZ, US_SF, US_CR)
     link.ser.write(encode_hw_frame(HW_CMD_SET_RADIO, radio_payload))
@@ -495,6 +510,7 @@ def main():
     for link in links:
         configure_us_defaults(link, print_lock)
         run_radio_diagnostics(link, print_lock)
+        kick_into_rx_mode(link, print_lock)
 
     stop_event = threading.Event()
     threads = [
