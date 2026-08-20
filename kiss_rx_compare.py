@@ -41,6 +41,8 @@ KISS_CMD_RETURN = 0xFF
 
 HW_CMD_SET_RADIO = 0x09
 HW_CMD_SET_TX_POWER = 0x0A
+HW_CMD_GET_RADIO = 0x0B
+HW_CMD_GET_NOISE_FLOOR = 0x10
 HW_CMD_GET_VERSION = 0x11
 HW_CMD_GET_DEVICE_NAME = 0x16
 HW_CMD_PING = 0x17
@@ -291,6 +293,47 @@ def wait_for_hw_response(link: RadioLink, timeout=STARTUP_RESPONSE_TIMEOUT_S):
     return False, "timeout"
 
 
+def wait_for_reply(link: RadioLink, expected_sub_cmd: int, timeout=STARTUP_RESPONSE_TIMEOUT_S):
+    """Read raw bytes directly, waiting for a specific SETHARDWARE response sub-command.
+    Used only during single-threaded startup, before reader threads start."""
+    decoder = KissDecoder()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        data = link.ser.read(256)
+        if not data:
+            continue
+        for frame in decoder.feed(data):
+            if len(frame) >= 2 and (frame[0] & 0x0F) == KISS_CMD_SETHARDWARE:
+                sub_cmd = frame[1]
+                if sub_cmd == expected_sub_cmd:
+                    return frame[2:]
+                if sub_cmd == HW_RESP_ERROR:
+                    return None
+    return None
+
+
+def run_radio_diagnostics(link: RadioLink, print_lock: threading.Lock):
+    """Read back applied radio config and noise floor, to sanity-check that SET_RADIO
+    actually took effect and that the receiver is picking up any RF energy at all."""
+    link.ser.write(encode_hw_frame(HW_CMD_GET_RADIO))
+    payload = wait_for_reply(link, hw_resp(HW_CMD_GET_RADIO))
+    if payload is not None and len(payload) >= 10:
+        freq_hz, bw_hz, sf, cr = struct.unpack("<IIBB", payload[:10])
+        message = f"GET_RADIO readback: {freq_hz / 1e6:.3f} MHz, {bw_hz / 1e3:.1f} kHz, SF{sf}, CR{cr}"
+    else:
+        message = "GET_RADIO readback: FAILED (no response)"
+    log_event(link, {"type": "info", "message": message}, print_lock)
+
+    link.ser.write(encode_hw_frame(HW_CMD_GET_NOISE_FLOOR))
+    payload = wait_for_reply(link, hw_resp(HW_CMD_GET_NOISE_FLOOR))
+    if payload is not None and len(payload) >= 2:
+        noise_dbm = struct.unpack("<h", payload[:2])[0]
+        message = f"GET_NOISE_FLOOR: {noise_dbm} dBm"
+    else:
+        message = "GET_NOISE_FLOOR: FAILED (no response)"
+    log_event(link, {"type": "info", "message": message}, print_lock)
+
+
 def configure_us_defaults(link: RadioLink, print_lock: threading.Lock):
     radio_payload = struct.pack("<IIBB", US_FREQ_HZ, US_BW_HZ, US_SF, US_CR)
     link.ser.write(encode_hw_frame(HW_CMD_SET_RADIO, radio_payload))
@@ -299,7 +342,7 @@ def configure_us_defaults(link: RadioLink, print_lock: threading.Lock):
         link,
         {
             "type": "info",
-            "message": f"SET_RADIO({US_FREQ_HZ / 1e6:.1f} MHz, {US_BW_HZ / 1e3:.0f} kHz, SF{US_SF}, CR{US_CR}) "
+            "message": f"SET_RADIO({US_FREQ_HZ / 1e6:.3f} MHz, {US_BW_HZ / 1e3:.1f} kHz, SF{US_SF}, CR{US_CR}) "
             + ("OK" if ok else f"FAILED ({err})"),
         },
         print_lock,
@@ -336,8 +379,14 @@ def by_id_for_device(dev_path: str) -> str | None:
     return None
 
 
+def is_phantom_legacy_port(p) -> bool:
+    """Filter out /dev/ttyS* legacy platform UARTs that aren't backed by real hardware."""
+    return p.vid is None and Path(p.device).name.startswith("ttyS")
+
+
 def discover_ports():
     ports = sorted(list_ports.comports(), key=lambda p: p.device)
+    ports = [p for p in ports if not is_phantom_legacy_port(p)]
     for p in ports:
         by_id = by_id_for_device(p.device)
         if by_id:
@@ -445,6 +494,7 @@ def main():
     print(f"Configuring US-band defaults on {'both radios' if link_b else 'the radio'}...")
     for link in links:
         configure_us_defaults(link, print_lock)
+        run_radio_diagnostics(link, print_lock)
 
     stop_event = threading.Event()
     threads = [
