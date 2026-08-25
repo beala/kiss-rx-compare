@@ -526,6 +526,8 @@ def select_ports(explicit_a, explicit_b, single=False):
 
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)  # otherwise stdout fully buffers when piped (e.g. into tee)
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port-a", help="Serial device for radio A (skip auto-detect)")
     parser.add_argument("--port-b", help="Serial device for radio B (skip auto-detect)")
