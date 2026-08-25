@@ -46,6 +46,7 @@ HW_CMD_GET_CURRENT_RSSI = 0x0D
 HW_CMD_GET_NOISE_FLOOR = 0x10
 HW_CMD_GET_VERSION = 0x11
 HW_CMD_GET_STATS = 0x12
+HW_CMD_GET_BATTERY = 0x13
 HW_CMD_GET_DEVICE_NAME = 0x16
 HW_CMD_PING = 0x17
 
@@ -358,6 +359,15 @@ def run_radio_diagnostics(link: RadioLink, print_lock: threading.Lock):
         message = f"GET_NOISE_FLOOR: {noise_dbm} dBm"
     else:
         message = "GET_NOISE_FLOOR: FAILED (no response)"
+    log_event(link, {"type": "info", "message": message}, print_lock)
+
+    link.ser.write(encode_hw_frame(HW_CMD_GET_BATTERY))
+    payload = wait_for_reply(link, hw_resp(HW_CMD_GET_BATTERY))
+    if payload is not None and len(payload) >= 2:
+        millivolts = struct.unpack("<H", payload[:2])[0]
+        message = f"GET_BATTERY: {millivolts / 1000.0:.2f} V"
+    else:
+        message = "GET_BATTERY: FAILED (no response)"
     log_event(link, {"type": "info", "message": message}, print_lock)
 
 
