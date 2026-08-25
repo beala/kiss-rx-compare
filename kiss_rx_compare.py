@@ -42,6 +42,7 @@ KISS_CMD_RETURN = 0xFF
 HW_CMD_SET_RADIO = 0x09
 HW_CMD_SET_TX_POWER = 0x0A
 HW_CMD_GET_RADIO = 0x0B
+HW_CMD_GET_CURRENT_RSSI = 0x0D
 HW_CMD_GET_NOISE_FLOOR = 0x10
 HW_CMD_GET_VERSION = 0x11
 HW_CMD_GET_STATS = 0x12
@@ -52,8 +53,6 @@ HW_RESP_OK = 0xF0
 HW_RESP_ERROR = 0xF1
 HW_RESP_TX_DONE = 0xF8
 HW_RESP_RX_META = 0xF9
-
-STATS_POLL_INTERVAL_S = 5.0
 
 
 def hw_resp(cmd):
@@ -69,6 +68,7 @@ US_TX_POWER_DBM = 0
 
 READ_TIMEOUT_S = 0.2
 STARTUP_RESPONSE_TIMEOUT_S = 2.0
+STATS_POLL_INTERVAL_S = 5.0
 
 
 def now_iso():
@@ -143,6 +143,7 @@ class RadioLink:
     pending: "PendingPacket | None" = None
     packet_count: int = 0
     log_fh: object = None
+    last_stats: "tuple[int, int, int] | None" = None
 
 
 def hexdump(data: bytes) -> str:
@@ -176,6 +177,8 @@ def format_console(event: dict) -> str:
         return f"{prefix}META (no matching packet) rssi={event['rssi_dbm']} snr={event['snr_db']:.2f}"
     if kind == "packet_no_meta":
         return f"{prefix}RX len={event['len']:<3} (no meta received) payload={event['payload_hex']}"
+    if kind == "decode_error":
+        return f"{prefix}DECODE FAILED x{event['count']} (header/CRC detected but couldn't be decoded into a packet)"
     if kind == "hw_resp":
         return f"{prefix}HW resp sub_cmd=0x{event['sub_cmd']:02X} payload={event['payload_hex']}"
     if kind == "hw_error":
@@ -184,8 +187,6 @@ def format_console(event: dict) -> str:
         return f"{prefix}HW OK"
     if kind == "tx_done":
         return f"{prefix}TX done result=0x{event['result']:02X}"
-    if kind == "stats":
-        return f"{prefix}STATS rx={event['rx']} tx={event['tx']} errors={event['errors']}"
     if kind == "info":
         return f"{prefix}{event['message']}"
     return f"{prefix}{event}"
@@ -264,9 +265,13 @@ def handle_frame(link: RadioLink, frame: bytes, print_lock: threading.Lock):
             log_event(link, {"type": "tx_done", "result": result}, print_lock)
             return
 
-        if sub_cmd == hw_resp(HW_CMD_GET_STATS) and len(payload) >= 12:
-            rx, tx, errors = struct.unpack("<III", payload[:12])
-            log_event(link, {"type": "stats", "rx": rx, "tx": tx, "errors": errors}, print_lock)
+        if sub_cmd == hw_resp(HW_CMD_GET_STATS):
+            if len(payload) >= 12:
+                stats = struct.unpack("<III", payload[:12])
+                _, _, errors = stats
+                if link.last_stats is not None and errors > link.last_stats[2]:
+                    log_event(link, {"type": "decode_error", "count": errors - link.last_stats[2]}, print_lock)
+                link.last_stats = stats
             return
 
         log_event(link, {"type": "hw_resp", "sub_cmd": sub_cmd, "payload_hex": hexdump(payload)}, print_lock)
@@ -283,6 +288,18 @@ def reader_thread(link: RadioLink, print_lock: threading.Lock, stop_event: threa
             continue
         for frame in link.decoder.feed(data):
             handle_frame(link, frame, print_lock)
+
+
+def stats_poll_thread(link: RadioLink, stop_event: threading.Event, interval=STATS_POLL_INTERVAL_S):
+    """Periodically request GetStats so RX errors (packets whose header/CRC the
+    radio detected but couldn't decode) show up in the log -- those never
+    generate a Data/RxMeta frame on their own, so without this poll a failing
+    receiver looks identical to a silent one."""
+    while not stop_event.wait(interval):
+        try:
+            link.ser.write(encode_hw_frame(HW_CMD_GET_STATS))
+        except serial.SerialException:
+            return
 
 
 def wait_for_hw_response(link: RadioLink, timeout=STARTUP_RESPONSE_TIMEOUT_S):
@@ -344,19 +361,40 @@ def run_radio_diagnostics(link: RadioLink, print_lock: threading.Lock):
     log_event(link, {"type": "info", "message": message}, print_lock)
 
 
-def kick_into_rx_mode(link: RadioLink, print_lock: threading.Lock):
-    """Transmit a throwaway packet to force the firmware's RX state machine to
-    reset. A live SetRadio doesn't itself re-arm the receiver on the new
-    frequency -- that only happens on TX completion or the next periodic AGC
-    reset (up to 30s later), so without this the radio can silently sit
-    deaf-but-configured right after startup."""
-    link.ser.write(encode_kiss_frame(KISS_CMD_DATA, b"\x00"))
-    payload = wait_for_reply(link, HW_RESP_TX_DONE, timeout=5.0)
-    if payload is not None and len(payload) >= 1:
-        message = "Kick TX " + ("OK" if payload[0] else "FAILED (radio reported TX failure)")
-    else:
-        message = "Kick TX FAILED (no TX_DONE response)"
-    log_event(link, {"type": "info", "message": message}, print_lock)
+def rssi_monitor(link: RadioLink, interval=0.2):
+    """Continuously poll GetCurrentRssi and print it live. This reads the raw
+    RF front-end power level directly -- it moves on any energy the radio
+    front-end picks up, whether or not MeshCore can decode a packet out of it.
+    Use this to tell 'RF chain isn't detecting anything' (RSSI never moves,
+    hints at antenna/RF hardware) apart from 'detects energy but can't decode
+    it' (RSSI moves fine, but --no packets, check GetStats error counter)."""
+    print(f"\nLive RSSI monitor for radio {link.label} ({link.port}). Press Ctrl+C to stop.")
+    print("Trigger a transmission on the other device nearby and watch for the value to jump up (less negative).\n")
+    decoder = KissDecoder()
+    try:
+        while True:
+            link.ser.write(encode_hw_frame(HW_CMD_GET_CURRENT_RSSI))
+            deadline = time.time() + 1.0
+            rssi = None
+            while time.time() < deadline and rssi is None:
+                data = link.ser.read(64)
+                if not data:
+                    continue
+                for frame in decoder.feed(data):
+                    if len(frame) >= 3 and (frame[0] & 0x0F) == KISS_CMD_SETHARDWARE and frame[1] == hw_resp(
+                        HW_CMD_GET_CURRENT_RSSI
+                    ):
+                        rssi = struct.unpack("b", frame[2:3])[0]
+                        break
+            ts = now_iso()
+            if rssi is not None:
+                bar = "#" * max(0, min(60, rssi + 130))
+                print(f"\r[{ts}] RSSI: {rssi:>4} dBm {bar:<60}", end="", flush=True)
+            else:
+                print(f"\r[{ts}] RSSI: no response (timeout){' ' * 40}", end="", flush=True)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print()
 
 
 def configure_us_defaults(link: RadioLink, print_lock: threading.Lock):
@@ -489,7 +527,15 @@ def main():
     parser.add_argument(
         "--single", action="store_true", help="Run with only one radio connected (for testing)"
     )
+    parser.add_argument(
+        "--rssi-monitor",
+        action="store_true",
+        help="Skip the packet-compare loop; configure radio A and print its live raw RSSI reading instead "
+        "(implies --single). Use this to check whether the RF front-end detects any energy at all.",
+    )
     args = parser.parse_args()
+    if args.rssi_monitor:
+        args.single = True
 
     port_a, port_b = select_ports(args.port_a, args.port_b, single=args.single)
     print(f"Radio A: {port_a}")
@@ -520,11 +566,18 @@ def main():
     for link in links:
         configure_us_defaults(link, print_lock)
         run_radio_diagnostics(link, print_lock)
-        kick_into_rx_mode(link, print_lock)
+
+    if args.rssi_monitor:
+        rssi_monitor(link_a)
+        link_a.ser.close()
+        return
 
     stop_event = threading.Event()
     threads = [
         threading.Thread(target=reader_thread, args=(link, print_lock, stop_event), daemon=True)
+        for link in links
+    ] + [
+        threading.Thread(target=stats_poll_thread, args=(link, stop_event), daemon=True)
         for link in links
     ]
     for t in threads:
@@ -544,13 +597,8 @@ def main():
 
     print(f"\nListening for packets on {'both radios' if link_b else 'the radio'}. Press Ctrl+C to stop.\n")
     try:
-        next_stats_poll = time.time() + STATS_POLL_INTERVAL_S
         while not stop_event.is_set():
             time.sleep(0.2)
-            if time.time() >= next_stats_poll:
-                for link in links:
-                    link.ser.write(encode_hw_frame(HW_CMD_GET_STATS))
-                next_stats_poll = time.time() + STATS_POLL_INTERVAL_S
     finally:
         stop_event.set()
         for t in threads:
