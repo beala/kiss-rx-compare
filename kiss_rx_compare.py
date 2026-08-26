@@ -167,7 +167,7 @@ def decode_mc_packet(payload: bytes) -> dict:
         if payload_type == 0x09:  # TRACE
             dedup_key += bytes([path_len_byte])
         dedup_key += bytes(app_payload)
-        info["dedup_key"] = dedup_key
+        info["dedup_key"] = dedup_key.hex()  # str, not bytes: hashable and JSON-safe for the log
 
         _decode_mc_app_payload(payload_type, app_payload, info)
     except (IndexError, struct.error):
@@ -477,7 +477,7 @@ class PayloadTracker:
         self.lock = threading.Lock()
         self.labels_by_key = {}  # dedup_key -> set of labels that have received it
 
-    def observe(self, label: str, key: bytes):
+    def observe(self, label: str, key: str):
         with self.lock:
             self.labels_by_key.setdefault(key, set()).add(label)
 
@@ -712,7 +712,7 @@ def format_console(event: dict) -> str:
     return f"{prefix}{event}"
 
 
-def record_packet_stats(link: RadioLink, rssi_dbm: int, snr_db: float, mc: dict, dedup_key: bytes):
+def record_packet_stats(link: RadioLink, rssi_dbm: int, snr_db: float, mc: dict, dedup_key: str):
     link.rssi_stats.add(rssi_dbm)
     link.snr_stats.add(snr_db)
     link.rolling_rssi.append(rssi_dbm)
@@ -772,7 +772,7 @@ def handle_frame(
                 link.pending = None
                 link.packet_count += 1
                 mc = decode_mc_packet(pkt.payload)
-                dedup_key = mc.get("dedup_key", pkt.payload)
+                dedup_key = mc.get("dedup_key", pkt.payload.hex())
                 record_packet_stats(link, rssi_dbm, snr_db, mc, dedup_key)
                 if mc.get("payload_type") == "ADVERT" and "node_hash" in mc and node_table is not None:
                     node_table.observe(
