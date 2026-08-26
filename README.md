@@ -38,6 +38,16 @@ Pass `--single` to run with only one radio connected, for testing:
 uv run kiss_rx_compare.py --single
 ```
 
+## Live split-screen view
+
+When stdout is a terminal, the listening phase defaults to a live two-pane
+view: a scrolling packet log on the left, a continuously-updated stats
+summary on the right (press `q` or Ctrl+C to quit). Pass `--ui plain` for
+the original single-stream console (used automatically when stdout isn't a
+terminal, e.g. piped into `tee`), or `--ui split`/`--ui auto` to control it
+explicitly. The JSONL log files are written the same way regardless of
+which UI is active.
+
 ## Packet decoding & comparison stats
 
 Each received packet is decoded (best-effort, cleartext fields only — no
@@ -67,3 +77,25 @@ The JSONL log itself is unaffected by summaries — it stays a full,
 unaggregated event stream; `"unique_to_radio"` events are added to a
 radio's log when the match window expires without the other radio
 reporting the same packet.
+
+### Packets vs. payloads
+
+A flood-routed packet gets relayed by every repeater that hears it, and
+each relay is a distinct over-the-air reception (different path, different
+timing, different RSSI/SNR) even though it's the same underlying message.
+The summary tracks both:
+
+- **Packets** — every individual reception, exactly as it arrived.
+- **Payloads** — messages deduplicated the same way MeshCore's own
+  flood-routing dedup does it (payload type + payload bytes, ignoring the
+  path/header that changes at each hop), so ten repeater copies of the same
+  advert count once.
+
+Per radio, this shows up as `packets: N  unique payloads: M (repeated via
+relay: N-M)`. Across radios, "heard by only one radio" is reported at both
+levels: the packet-level match (`--match-window`) only looks at a short
+window and can flag two receptions as mismatched just because a relay copy
+arrived outside it, even though both radios did eventually get the
+message. The payload-level tally (session-lifetime, no window) is the more
+meaningful one for spotting an actual reception gap — a message one radio
+never received in any form — and should generally be small.

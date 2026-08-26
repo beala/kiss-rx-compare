@@ -27,6 +27,11 @@ from pathlib import Path
 import serial
 from serial.tools import list_ports
 
+try:
+    import curses
+except ImportError:  # e.g. stock Windows Python
+    curses = None
+
 # --- KISS framing ---------------------------------------------------------
 
 KISS_FEND = 0xC0
@@ -74,6 +79,7 @@ STATS_POLL_INTERVAL_S = 5.0
 DEFAULT_ROLLING_WINDOW = 20
 DEFAULT_MATCH_WINDOW_S = 3.0
 DEFAULT_SUMMARY_INTERVAL_S = 30.0
+RECENT_UNIQUE_HISTORY = 12
 
 # --- MeshCore on-air packet parsing (best-effort, cleartext fields only) ---
 #
@@ -150,6 +156,19 @@ def decode_mc_packet(payload: bytes) -> dict:
             info["path_hashes"] = path_bytes.hex()
 
         app_payload = payload[i:]
+
+        # Identifies "the same message" independent of routing: a packet flood-relayed
+        # through several repeaters gets a different header/path (and thus different raw
+        # bytes) at every hop, but MeshCore's own flood-dedup hashes exactly this --
+        # payload type + payload bytes (+ path_len for TRACE) -- via Packet::calculatePacketHash
+        # (src/Packet.cpp). Mirroring it here lets us tell "distinct messages" apart from
+        # "the same message heard again via a different repeater path".
+        dedup_key = bytes([payload_type])
+        if payload_type == 0x09:  # TRACE
+            dedup_key += bytes([path_len_byte])
+        dedup_key += bytes(app_payload)
+        info["dedup_key"] = dedup_key
+
         _decode_mc_app_payload(payload_type, app_payload, info)
     except (IndexError, struct.error):
         pass
@@ -342,6 +361,15 @@ class RadioLink:
     snr_stats: RunningStat = field(default_factory=RunningStat)
     rolling_rssi: deque = field(default_factory=lambda: deque(maxlen=DEFAULT_ROLLING_WINDOW))
     rolling_snr: deque = field(default_factory=lambda: deque(maxlen=DEFAULT_ROLLING_WINDOW))
+    seen_payload_keys: set = field(default_factory=set)  # distinct messages, deduped across repeater relays
+
+    @property
+    def unique_payload_count(self) -> int:
+        return len(self.seen_payload_keys)
+
+    @property
+    def repeated_payload_count(self) -> int:
+        return self.packet_count - self.unique_payload_count
 
 
 class CrossRadioMatcher:
@@ -365,6 +393,7 @@ class CrossRadioMatcher:
         self.delta_snr = RunningStat()
         self.rolling_delta_rssi = deque(maxlen=rolling_window)
         self.rolling_delta_snr = deque(maxlen=rolling_window)
+        self.recent_unique = deque(maxlen=RECENT_UNIQUE_HISTORY)  # most-recent-last: (label, rssi, snr, mc)
 
     def observe(self, label: str, payload: bytes, ts: float, rssi: int, snr: float, mc: dict):
         with self.lock:
@@ -392,6 +421,8 @@ class CrossRadioMatcher:
             return None
         (label, seen_tuple) = next(iter(seen.items()))
         self.unique_count[label] += 1
+        rssi, snr, mc = seen_tuple
+        self.recent_unique.append((label, rssi, snr, mc))
         return label, seen_tuple
 
     def sweep(self) -> list:
@@ -428,6 +459,40 @@ class CrossRadioMatcher:
             return results
 
 
+class PayloadTracker:
+    """Session-lifetime (non-expiring) record of which radio(s) have ever received
+    a given message, keyed by its dedup_key (see decode_mc_packet). Unlike
+    CrossRadioMatcher (which only correlates receptions within a short time
+    window, to compare RSSI/SNR of literally the same over-the-air burst), this
+    has no expiry -- a repeater can relay a message well after the original
+    transmission, so "did the other radio ever get this at all" can only be
+    answered by tracking for the whole session.
+
+    This is what actually answers 'is there a message my radios disagree on
+    entirely' as opposed to 'these two specific receptions didn't line up in
+    time' -- repeater relays make the latter common and the former rare.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.labels_by_key = {}  # dedup_key -> set of labels that have received it
+
+    def observe(self, label: str, key: bytes):
+        with self.lock:
+            self.labels_by_key.setdefault(key, set()).add(label)
+
+    def summarize(self, all_labels: list) -> dict:
+        with self.lock:
+            only = defaultdict(int)
+            both = 0
+            for labels in self.labels_by_key.values():
+                if len(labels) == 1:
+                    only[next(iter(labels))] += 1
+                elif len(labels) >= len(all_labels):
+                    both += 1
+            return {"total": len(self.labels_by_key), "both": both, "only": dict(only)}
+
+
 class NodeTable:
     """Tracks distinct MeshCore nodes seen via their (cleartext, self-signed)
     ADVERT packets, and which radio(s) hear each one -- useful for spotting
@@ -454,6 +519,138 @@ class NodeTable:
             return {h: {**rec, "per_radio": dict(rec["per_radio"])} for h, rec in self.nodes.items()}
 
 
+class PlainConsole:
+    """Original behavior: one scrolling stream of log lines, with the periodic
+    stats summary printed inline as its own block."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+
+    def log(self, line: str):
+        print(line)
+
+    def set_summary(self, text: str):
+        print(text)
+
+    def run_until_stopped(self, stop_event: threading.Event):
+        while not stop_event.is_set():
+            time.sleep(0.2)
+
+    def teardown(self):
+        pass
+
+
+class SplitConsole:
+    """Live two-pane terminal UI: scrolling packet log on the left, a
+    continuously-updated stats summary on the right. Built on the stdlib
+    `curses` module -- no extra dependencies."""
+
+    MIN_RIGHT_WIDTH = 30
+    RIGHT_WIDTH_FRACTION = 0.4
+
+    def __init__(self, stdscr, title: str):
+        self.lock = threading.Lock()
+        self.stdscr = stdscr
+        self.title = title
+        self.log_buf = deque(maxlen=4000)
+        self.summary_lines = ["(waiting for data...)"]
+
+        curses.noecho()
+        curses.cbreak()
+        stdscr.keypad(True)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        self._layout()
+        self._redraw_all()
+
+    def _layout(self):
+        max_y, max_x = self.stdscr.getmaxyx()
+        self.max_y, self.max_x = max_y, max_x
+        right_w = max(self.MIN_RIGHT_WIDTH, int(max_x * self.RIGHT_WIDTH_FRACTION))
+        right_w = min(right_w, max(10, max_x - 20))
+        left_w = max(1, max_x - right_w - 1)
+        body_h = max(1, max_y - 1)
+        self.left_win = curses.newwin(body_h, left_w, 1, 0)
+        self.right_win = curses.newwin(body_h, right_w, 1, min(left_w + 1, max_x - 1))
+        self.left_h = body_h
+
+    def _safe_addstr(self, win, y: int, x: int, text: str, attr=0):
+        h, w = win.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        try:
+            win.addstr(y, x, text[: max(0, w - x - 1)], attr)
+        except curses.error:
+            pass  # bottom-right cell write is a known curses quirk; harmless
+
+    def _redraw_header(self):
+        header = f" {self.title}   [q] quit "
+        self._safe_addstr(self.stdscr, 0, 0, header.ljust(self.max_x - 1), curses.A_REVERSE)
+        for y in range(1, self.max_y):
+            self._safe_addstr(self.stdscr, y, self.left_win.getmaxyx()[1], "|")
+        self.stdscr.noutrefresh()
+
+    def _redraw_log(self):
+        self.left_win.erase()
+        for i, line in enumerate(list(self.log_buf)[-self.left_h :]):
+            self._safe_addstr(self.left_win, i, 0, line)
+        self.left_win.noutrefresh()
+
+    def _redraw_summary(self):
+        self.right_win.erase()
+        for i, line in enumerate(self.summary_lines):
+            self._safe_addstr(self.right_win, i, 0, line)
+        self.right_win.noutrefresh()
+
+    def _redraw_all(self):
+        self.stdscr.erase()
+        self._redraw_header()
+        self._redraw_log()
+        self._redraw_summary()
+        curses.doupdate()
+
+    def log(self, line: str):
+        """Caller must hold self.lock (curses isn't thread-safe)."""
+        self.log_buf.append(line)
+        self._redraw_log()
+        curses.doupdate()
+
+    def set_summary(self, text: str):
+        """Caller must hold self.lock (curses isn't thread-safe)."""
+        self.summary_lines = text.strip("\n").splitlines()
+        self._redraw_summary()
+        curses.doupdate()
+
+    def run_until_stopped(self, stop_event: threading.Event):
+        self.stdscr.timeout(200)
+        while not stop_event.is_set():
+            try:
+                ch = self.stdscr.getch()
+            except curses.error:
+                ch = -1
+            if ch == curses.KEY_RESIZE:
+                with self.lock:
+                    self._layout()
+                    self._redraw_all()
+            elif ch in (ord("q"), ord("Q")):
+                stop_event.set()
+
+    def teardown(self):
+        try:
+            self.stdscr.keypad(False)
+            curses.nocbreak()
+            curses.echo()
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        try:
+            curses.endwin()
+        except curses.error:
+            pass
+
+
 def hexdump(data: bytes) -> str:
     return data.hex()
 
@@ -462,11 +659,11 @@ def printable_ascii(data: bytes) -> str:
     return "".join(chr(b) if 32 <= b < 127 else "." for b in data)
 
 
-def log_event(link: RadioLink, event: dict, print_lock: threading.Lock):
+def log_event(link: RadioLink, event: dict, console: "PlainConsole | SplitConsole"):
     event = {"time": now_iso(), "radio": link.label, "port": link.port, **event}
     line = json.dumps(event)
-    with print_lock:
-        print(format_console(event))
+    with console.lock:
+        console.log(format_console(event))
         if link.log_fh:
             link.log_fh.write(line + "\n")
             link.log_fh.flush()
@@ -515,20 +712,22 @@ def format_console(event: dict) -> str:
     return f"{prefix}{event}"
 
 
-def record_packet_stats(link: RadioLink, rssi_dbm: int, snr_db: float, mc: dict):
+def record_packet_stats(link: RadioLink, rssi_dbm: int, snr_db: float, mc: dict, dedup_key: bytes):
     link.rssi_stats.add(rssi_dbm)
     link.snr_stats.add(snr_db)
     link.rolling_rssi.append(rssi_dbm)
     link.rolling_snr.append(snr_db)
     link.payload_type_counts[mc.get("payload_type", "UNKNOWN")] += 1
+    link.seen_payload_keys.add(dedup_key)
 
 
 def handle_frame(
     link: RadioLink,
     frame: bytes,
-    print_lock: threading.Lock,
+    console: "PlainConsole | SplitConsole",
     matcher: "CrossRadioMatcher | None",
     node_table: "NodeTable | None",
+    payload_tracker: "PayloadTracker | None" = None,
 ):
     if len(frame) < 1:
         return
@@ -552,7 +751,7 @@ def handle_frame(
                     "payload_hex": hexdump(link.pending.payload),
                     "payload_ascii": printable_ascii(link.pending.payload),
                 },
-                print_lock,
+                console,
             )
         link.pending = PendingPacket(payload=bytes(data), recv_time=time.time())
         return
@@ -573,13 +772,16 @@ def handle_frame(
                 link.pending = None
                 link.packet_count += 1
                 mc = decode_mc_packet(pkt.payload)
-                record_packet_stats(link, rssi_dbm, snr_db, mc)
+                dedup_key = mc.get("dedup_key", pkt.payload)
+                record_packet_stats(link, rssi_dbm, snr_db, mc, dedup_key)
                 if mc.get("payload_type") == "ADVERT" and "node_hash" in mc and node_table is not None:
                     node_table.observe(
                         link.label, mc["node_hash"], mc.get("name"), mc.get("adv_type"), rssi_dbm, snr_db
                     )
                 if matcher is not None:
                     matcher.observe(link.label, pkt.payload, pkt.recv_time, rssi_dbm, snr_db, mc)
+                if payload_tracker is not None:
+                    payload_tracker.observe(link.label, dedup_key)
                 log_event(
                     link,
                     {
@@ -592,25 +794,25 @@ def handle_frame(
                         "snr_db": snr_db,
                         "mc": mc,
                     },
-                    print_lock,
+                    console,
                 )
             else:
                 link.meta_only_count += 1
-                log_event(link, {"type": "meta_only", "rssi_dbm": rssi_dbm, "snr_db": snr_db}, print_lock)
+                log_event(link, {"type": "meta_only", "rssi_dbm": rssi_dbm, "snr_db": snr_db}, console)
             return
 
         if sub_cmd == HW_RESP_ERROR:
             code = payload[0] if payload else 0
-            log_event(link, {"type": "hw_error", "code": code}, print_lock)
+            log_event(link, {"type": "hw_error", "code": code}, console)
             return
 
         if sub_cmd == HW_RESP_OK:
-            log_event(link, {"type": "hw_ok"}, print_lock)
+            log_event(link, {"type": "hw_ok"}, console)
             return
 
         if sub_cmd == HW_RESP_TX_DONE:
             result = payload[0] if payload else 0
-            log_event(link, {"type": "tx_done", "result": result}, print_lock)
+            log_event(link, {"type": "tx_done", "result": result}, console)
             return
 
         if sub_cmd == hw_resp(HW_CMD_GET_STATS):
@@ -620,33 +822,34 @@ def handle_frame(
                 if link.last_stats is not None and errors > link.last_stats[2]:
                     delta = errors - link.last_stats[2]
                     link.decode_error_total += delta
-                    log_event(link, {"type": "decode_error", "count": delta}, print_lock)
+                    log_event(link, {"type": "decode_error", "count": delta}, console)
                 link.last_stats = stats
             return
 
-        log_event(link, {"type": "hw_resp", "sub_cmd": sub_cmd, "payload_hex": hexdump(payload)}, print_lock)
+        log_event(link, {"type": "hw_resp", "sub_cmd": sub_cmd, "payload_hex": hexdump(payload)}, console)
 
 
 def reader_thread(
     link: RadioLink,
-    print_lock: threading.Lock,
+    console: "PlainConsole | SplitConsole",
     stop_event: threading.Event,
     matcher: "CrossRadioMatcher | None" = None,
     node_table: "NodeTable | None" = None,
+    payload_tracker: "PayloadTracker | None" = None,
 ):
     while not stop_event.is_set():
         try:
             data = link.ser.read(4096)
         except serial.SerialException as e:
-            log_event(link, {"type": "info", "message": f"serial error: {e}"}, print_lock)
+            log_event(link, {"type": "info", "message": f"serial error: {e}"}, console)
             return
         if not data:
             continue
         for frame in link.decoder.feed(data):
-            handle_frame(link, frame, print_lock, matcher, node_table)
+            handle_frame(link, frame, console, matcher, node_table, payload_tracker)
 
 
-def emit_unique_events(links_by_label: dict, results: list, print_lock: threading.Lock):
+def emit_unique_events(links_by_label: dict, results: list, console: "PlainConsole | SplitConsole"):
     """Log 'heard by only one radio' events discovered by a matcher sweep, into
     that radio's own log (console + JSONL)."""
     for label, rssi, snr, mc in results:
@@ -662,7 +865,7 @@ def emit_unique_events(links_by_label: dict, results: list, print_lock: threadin
                 "snr_db": snr,
                 "mc": mc,
             },
-            print_lock,
+            console,
         )
 
 
@@ -678,7 +881,11 @@ def fmt_stat(stat: RunningStat, rolling: deque, unit: str, precision: int = 1) -
 
 
 def render_summary(
-    links: list, matcher: "CrossRadioMatcher | None", node_table: NodeTable, start_time: float
+    links: list,
+    matcher: "CrossRadioMatcher | None",
+    node_table: NodeTable,
+    start_time: float,
+    payload_tracker: "PayloadTracker | None" = None,
 ) -> str:
     elapsed = int(time.time() - start_time)
     lines = [f"\n=== Summary @ {now_iso()} (elapsed {elapsed // 60}m{elapsed % 60:02d}s) ==="]
@@ -687,13 +894,17 @@ def render_summary(
         types = ", ".join(f"{t}={c}" for t, c in link.payload_type_counts.most_common())
         lines.append(f"Radio {link.label} ({link.port}):")
         lines.append(
-            f"  packets: {link.packet_count}   decode errors: {link.decode_error_total}   "
+            f"  packets: {link.packet_count}   unique payloads: {link.unique_payload_count} "
+            f"(repeated via relay: {link.repeated_payload_count})"
+        )
+        lines.append(
+            f"  decode errors: {link.decode_error_total}   "
             f"framing mismatches: {link.meta_only_count + link.no_meta_count}"
         )
         if matcher is not None:
             lines.append(
                 f"  heard by both radios: {matcher.both_count}   "
-                f"unique to {link.label}: {matcher.unique_count.get(link.label, 0)}"
+                f"unique packets to {link.label}: {matcher.unique_count.get(link.label, 0)}"
             )
         lines.append(f"  RSSI: {fmt_stat(link.rssi_stats, link.rolling_rssi, ' dBm', 1)}")
         lines.append(f"  SNR:  {fmt_stat(link.snr_stats, link.rolling_snr, ' dB', 2)}")
@@ -704,6 +915,20 @@ def render_summary(
         lines.append(f"Comparison (n={matcher.both_count} packets heard by both, delta = A - B):")
         lines.append(f"  ΔRSSI: {fmt_stat(matcher.delta_rssi, matcher.rolling_delta_rssi, ' dB', 1)}")
         lines.append(f"  ΔSNR:  {fmt_stat(matcher.delta_snr, matcher.rolling_delta_snr, ' dB', 2)}")
+        if matcher.recent_unique:
+            lines.append(f"Recently heard by only one radio (packet-level, last {len(matcher.recent_unique)}):")
+            for label, rssi, snr, mc in reversed(matcher.recent_unique):
+                desc = describe_mc_packet(mc) or f"len={mc.get('total_len', '?')}"
+                lines.append(f"  [{label}] {desc}  rssi={rssi} snr={snr:.1f}")
+
+    if payload_tracker is not None:
+        labels = [link.label for link in links]
+        pstats = payload_tracker.summarize(labels)
+        lines.append(
+            f"Distinct payloads (deduped across every repeater relay, n={pstats['total']}):"
+        )
+        only_parts = "   ".join(f"only {label}: {pstats['only'].get(label, 0)}" for label in sorted(labels))
+        lines.append(f"  seen by both radios (eventually): {pstats['both']}   {only_parts}")
 
     nodes = node_table.snapshot()
     if nodes:
@@ -726,19 +951,25 @@ def housekeeping_thread(
     matcher: "CrossRadioMatcher | None",
     node_table: NodeTable,
     stop_event: threading.Event,
-    print_lock: threading.Lock,
+    console: "PlainConsole | SplitConsole",
     summary_interval: float,
     start_time: float,
+    live_summary: bool = False,
+    payload_tracker: "PayloadTracker | None" = None,
 ):
+    """live_summary=True (split-screen UI) refreshes the summary pane on every
+    tick for a real-time feel; otherwise it's gated by summary_interval so a
+    plain scrolling console isn't flooded with repeated blocks."""
     links_by_label = {link.label: link for link in links}
     next_summary = start_time + summary_interval if summary_interval > 0 else None
     while not stop_event.wait(0.5):
         if matcher is not None:
-            emit_unique_events(links_by_label, matcher.sweep(), print_lock)
-        if next_summary is not None and time.time() >= next_summary:
-            with print_lock:
-                print(render_summary(links, matcher, node_table, start_time))
-            next_summary = time.time() + summary_interval
+            emit_unique_events(links_by_label, matcher.sweep(), console)
+        if live_summary or (next_summary is not None and time.time() >= next_summary):
+            with console.lock:
+                console.set_summary(render_summary(links, matcher, node_table, start_time, payload_tracker))
+            if next_summary is not None:
+                next_summary = time.time() + summary_interval
 
 
 def stats_poll_thread(link: RadioLink, stop_event: threading.Event, interval=STATS_POLL_INTERVAL_S):
@@ -790,7 +1021,7 @@ def wait_for_reply(link: RadioLink, expected_sub_cmd: int, timeout=STARTUP_RESPO
     return None
 
 
-def run_radio_diagnostics(link: RadioLink, print_lock: threading.Lock):
+def run_radio_diagnostics(link: RadioLink, console: "PlainConsole | SplitConsole"):
     """Read back applied radio config and noise floor, to sanity-check that SET_RADIO
     actually took effect and that the receiver is picking up any RF energy at all."""
     link.ser.write(encode_hw_frame(HW_CMD_GET_RADIO))
@@ -800,7 +1031,7 @@ def run_radio_diagnostics(link: RadioLink, print_lock: threading.Lock):
         message = f"GET_RADIO readback: {freq_hz / 1e6:.3f} MHz, {bw_hz / 1e3:.1f} kHz, SF{sf}, CR{cr}"
     else:
         message = "GET_RADIO readback: FAILED (no response)"
-    log_event(link, {"type": "info", "message": message}, print_lock)
+    log_event(link, {"type": "info", "message": message}, console)
 
     link.ser.write(encode_hw_frame(HW_CMD_GET_NOISE_FLOOR))
     payload = wait_for_reply(link, hw_resp(HW_CMD_GET_NOISE_FLOOR))
@@ -809,7 +1040,7 @@ def run_radio_diagnostics(link: RadioLink, print_lock: threading.Lock):
         message = f"GET_NOISE_FLOOR: {noise_dbm} dBm"
     else:
         message = "GET_NOISE_FLOOR: FAILED (no response)"
-    log_event(link, {"type": "info", "message": message}, print_lock)
+    log_event(link, {"type": "info", "message": message}, console)
 
     link.ser.write(encode_hw_frame(HW_CMD_GET_BATTERY))
     payload = wait_for_reply(link, hw_resp(HW_CMD_GET_BATTERY))
@@ -818,7 +1049,7 @@ def run_radio_diagnostics(link: RadioLink, print_lock: threading.Lock):
         message = f"GET_BATTERY: {millivolts / 1000.0:.2f} V"
     else:
         message = "GET_BATTERY: FAILED (no response)"
-    log_event(link, {"type": "info", "message": message}, print_lock)
+    log_event(link, {"type": "info", "message": message}, console)
 
 
 def rssi_monitor(link: RadioLink, interval=0.2):
@@ -857,7 +1088,7 @@ def rssi_monitor(link: RadioLink, interval=0.2):
         print()
 
 
-def configure_us_defaults(link: RadioLink, print_lock: threading.Lock):
+def configure_us_defaults(link: RadioLink, console: "PlainConsole | SplitConsole"):
     radio_payload = struct.pack("<IIBB", US_FREQ_HZ, US_BW_HZ, US_SF, US_CR)
     link.ser.write(encode_hw_frame(HW_CMD_SET_RADIO, radio_payload))
     ok, err = wait_for_hw_response(link)
@@ -868,7 +1099,7 @@ def configure_us_defaults(link: RadioLink, print_lock: threading.Lock):
             "message": f"SET_RADIO({US_FREQ_HZ / 1e6:.3f} MHz, {US_BW_HZ / 1e3:.1f} kHz, SF{US_SF}, CR{US_CR}) "
             + ("OK" if ok else f"FAILED ({err})"),
         },
-        print_lock,
+        console,
     )
 
     link.ser.write(encode_hw_frame(HW_CMD_SET_TX_POWER, bytes([US_TX_POWER_DBM])))
@@ -876,7 +1107,7 @@ def configure_us_defaults(link: RadioLink, print_lock: threading.Lock):
     log_event(
         link,
         {"type": "info", "message": f"SET_TX_POWER({US_TX_POWER_DBM} dBm) " + ("OK" if ok else f"FAILED ({err})")},
-        print_lock,
+        console,
     )
 
 
@@ -1015,6 +1246,14 @@ def main():
         help="Seconds to wait for the other radio to also report a packet before counting it as "
         f"'heard by only one radio' (default: {DEFAULT_MATCH_WINDOW_S})",
     )
+    parser.add_argument(
+        "--ui",
+        choices=["auto", "split", "plain"],
+        default="auto",
+        help="Console UI for the live listening phase: 'split' shows a live two-pane view "
+        "(scrolling packet log + continuously-updated stats), 'plain' is a single scrolling "
+        "stream. 'auto' (default) uses split when stdout is a terminal and curses is available.",
+    )
     args = parser.parse_args()
     if args.rssi_monitor:
         args.single = True
@@ -1049,25 +1288,51 @@ def main():
     matcher = (
         CrossRadioMatcher(window_s=args.match_window, rolling_window=args.rolling_window) if link_b else None
     )
+    payload_tracker = PayloadTracker() if link_b else None
 
-    print_lock = threading.Lock()
+    console = PlainConsole()
 
     print(f"Configuring US-band defaults on {'both radios' if link_b else 'the radio'}...")
     for link in links:
-        configure_us_defaults(link, print_lock)
-        run_radio_diagnostics(link, print_lock)
+        configure_us_defaults(link, console)
+        run_radio_diagnostics(link, console)
 
     if args.rssi_monitor:
         rssi_monitor(link_a)
         link_a.ser.close()
         return
 
+    want_split = args.ui == "split" or (args.ui == "auto" and sys.stdout.isatty())
+    if want_split and curses is None:
+        print("curses module unavailable; falling back to --ui plain.")
+        want_split = False
+
+    live_console = console
+    if want_split:
+        title = f"kiss-rx-compare  A={port_a}" + (f"  B={port_b}" if port_b else "  (single-radio)")
+        try:
+            stdscr = curses.initscr()
+            live_console = SplitConsole(stdscr, title)
+        except curses.error as e:
+            try:
+                curses.endwin()
+            except curses.error:
+                pass
+            print(f"Failed to start split-screen UI ({e}); falling back to plain console.")
+            live_console = console
+
+    def teardown_console():
+        if live_console is not console:
+            live_console.teardown()
+
     stop_event = threading.Event()
     start_time = time.time()
     threads = (
         [
             threading.Thread(
-                target=reader_thread, args=(link, print_lock, stop_event, matcher, node_table), daemon=True
+                target=reader_thread,
+                args=(link, live_console, stop_event, matcher, node_table, payload_tracker),
+                daemon=True,
             )
             for link in links
         ]
@@ -1075,7 +1340,17 @@ def main():
         + [
             threading.Thread(
                 target=housekeeping_thread,
-                args=(links, matcher, node_table, stop_event, print_lock, args.summary_interval, start_time),
+                args=(
+                    links,
+                    matcher,
+                    node_table,
+                    stop_event,
+                    live_console,
+                    args.summary_interval,
+                    start_time,
+                    live_console is not console,  # live_summary: refresh every tick in split-screen mode
+                    payload_tracker,
+                ),
                 daemon=True,
             )
         ]
@@ -1091,25 +1366,27 @@ def main():
         if sigint_count == 1:
             stop_event.set()
         else:
+            teardown_console()
             os._exit(1)
 
     signal.signal(signal.SIGINT, handle_sigint)
 
-    print(f"\nListening for packets on {'both radios' if link_b else 'the radio'}. Press Ctrl+C to stop.\n")
+    if live_console is console:
+        print(f"\nListening for packets on {'both radios' if link_b else 'the radio'}. Press Ctrl+C to stop.\n")
     try:
-        while not stop_event.is_set():
-            time.sleep(0.2)
+        live_console.run_until_stopped(stop_event)
     finally:
         stop_event.set()
         for t in threads:
             t.join(timeout=1.0)
         if matcher is not None:
-            emit_unique_events({link.label: link for link in links}, matcher.flush_all(), print_lock)
+            emit_unique_events({link.label: link for link in links}, matcher.flush_all(), live_console)
+        teardown_console()
         for link in links:
             link.ser.close()
             if link.log_fh:
                 link.log_fh.close()
-        print(render_summary(links, matcher, node_table, start_time))
+        print(render_summary(links, matcher, node_table, start_time, payload_tracker))
         print("\nDone.")
 
 
